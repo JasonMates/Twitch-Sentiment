@@ -1,0 +1,15 @@
+# Xojo (formerly REALbasic and Real Studio)
+
+.env
+*.pyc
+__pycache__/
+
+Builds*
+*.debug
+*.debug.app
+Debug*.exe
+Debug*/Debug*.exe
+Debug*/Debug*\ Libs
+*.rbuistate
+*.xojo_uistate
+*.obsolete*

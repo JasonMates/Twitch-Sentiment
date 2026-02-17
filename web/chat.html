@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Twitch Sentiment Chat</title>
+  <link rel="stylesheet" href="/static/chat.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="title">Stream Chat</div>
+      <div class="controls">
+        <input id="channelInput" type="text" placeholder="channel name" />
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" class="secondary">Stop</button>
+        <button id="popoutBtn" class="secondary">Popout</button>
+      </div>
+    </header>
+
+    <div class="statusbar">
+      <span id="statusText">Disconnected</span>
+      <span class="righttools">
+        <button id="nameColorBtn" class="tiny">Name Color: Sentiment</button>
+        <span id="modelText"></span>
+      </span>
+    </div>
+
+    <main id="chatList" class="chatlist"></main>
+
+    <footer class="footer">
+      <div id="statsText">0 messages</div>
+      <div class="sentiment-pills">
+        <span class="pill positive" id="pillPos">Positive 0%</span>
+        <span class="pill neutral" id="pillNeu">Neutral 0%</span>
+        <span class="pill negative" id="pillNeg">Negative 0%</span>
+      </div>
+    </footer>
+  </div>
+
+  <template id="messageTemplate">
+    <div class="msg-row">
+      <span class="msg-time"></span>
+      <span class="msg-sent"></span>
+      <span class="msg-user"></span>
+      <span class="msg-text"></span>
+    </div>
+  </template>
+
+  <script src="/static/chat.js"></script>
+</body>
+</html>
