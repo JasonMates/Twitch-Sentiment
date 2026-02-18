@@ -13,3 +13,8 @@ Debug*/Debug*\ Libs
 *.rbuistate
 *.xojo_uistate
 *.obsolete*
+
+# Local model artifacts and training checkpoints
+data/**/checkpoint-*/
+data/**/runs/
+data/**/events.out.tfevents*

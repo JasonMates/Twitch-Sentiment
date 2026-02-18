@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from display_bert import BertSentimentClassifier
+from display_bert import BertSentimentClassifier, resolve_model_source
 from twitch_listener import SimpleTwitchChatListener
 
 APP_DIR = Path(__file__).resolve().parent
@@ -57,33 +57,14 @@ class StartRequest(BaseModel):
     channel: str
 
 
-def resolve_model_dir() -> Path:
-    env_model_dir = os.getenv("CARDIFF_MODEL_DIR", "").strip()
-    if env_model_dir:
-        raw = Path(env_model_dir)
-        for p in [raw, APP_DIR / raw]:
-            if p.exists():
-                return p
-
-    candidates = [
-        APP_DIR / "data" / "cardiff_sentiment_model",
-        APP_DIR / "data" / "cardiff_sentiment_model_v2",
-        APP_DIR.parent / "data" / "cardiff_sentiment_model",
-        APP_DIR.parent / "data" / "cardiff_sentiment_model_v2",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-
-    return candidates[0]
-
-
 def load_classifier() -> BertSentimentClassifier:
-    model_dir = resolve_model_dir()
-    if not model_dir.exists():
+    model_source, model_opts = resolve_model_source(APP_DIR)
+    local_model_dir = Path(model_source)
+    has_local_model = local_model_dir.exists()
+    if not has_local_model and not os.getenv("MODEL_ID", "").strip():
         raise FileNotFoundError(
-            "Cardiff model not found. Train first with: "
-            "python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model"
+            "Local Cardiff model not found. Set MODEL_ID=JDMates/TwitchRoBERTaSentiment "
+            "or train first with: python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model_v2"
         )
 
     max_length = int(os.getenv("BERT_MAX_LENGTH", "128"))
@@ -93,11 +74,11 @@ def load_classifier() -> BertSentimentClassifier:
     target_priors = os.getenv("BERT_TARGET_PRIORS", "")
     train_priors = os.getenv("BERT_TRAIN_PRIORS", "")
 
-    meta_path = model_dir / "model_meta.json"
+    meta_path = local_model_dir / "model_meta.json"
     use_emote_tags = False
     normalize_twitter = False
     meta_lexicon_path = ""
-    if meta_path.exists():
+    if has_local_model and meta_path.exists():
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
         use_emote_tags = bool(meta.get("use_emote_tags", False))
@@ -113,7 +94,7 @@ def load_classifier() -> BertSentimentClassifier:
                 break
 
     return BertSentimentClassifier(
-        model_dir=model_dir,
+        model_source=model_source,
         max_length=max_length,
         use_emote_tags=use_emote_tags,
         emote_lexicon_path=lexicon_path,
@@ -123,6 +104,9 @@ def load_classifier() -> BertSentimentClassifier:
         target_priors_csv=target_priors,
         train_priors_csv=train_priors,
         normalize_twitter=normalize_twitter,
+        model_revision=model_opts.get("revision"),
+        hf_token=model_opts.get("token"),
+        local_files_only=bool(model_opts.get("local_files_only", False)),
     )
 
 
@@ -203,6 +187,7 @@ async def root():
 
 @app.get("/api/status")
 async def status():
+    model_source, _ = resolve_model_source(APP_DIR)
     window_count = len(recent_messages)
     window_counts = Counter([s for _, s in recent_messages])
     mps = 0.0
@@ -216,7 +201,7 @@ async def status():
         "channel": stats["channel"],
         "total": stats["total"],
         "started_at": stats["started_at"],
-        "model_dir": str(resolve_model_dir()),
+        "model_source": str(model_source),
         "window_size": ROLLING_WINDOW_SIZE,
         "window_count": window_count,
         "messages_per_second": mps,
@@ -292,6 +277,7 @@ async def websocket_messages(ws: WebSocket):
     await ws.accept()
     async with _clients_lock:
         connected_clients.add(ws)
+    model_source, _ = resolve_model_source(APP_DIR)
     try:
         await ws.send_json(
             {
@@ -299,7 +285,7 @@ async def websocket_messages(ws: WebSocket):
                 "running": stats["running"],
                 "channel": stats["channel"],
                 "total": stats["total"],
-                "model_dir": str(resolve_model_dir()),
+                "model_source": str(model_source),
                 "window_size": ROLLING_WINDOW_SIZE,
             }
         )

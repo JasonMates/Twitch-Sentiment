@@ -125,7 +125,7 @@ function connectWs() {
     if (payload.type === "stats") updateStats(payload);
     if (payload.type === "status") {
       if (payload.running) statusText.textContent = `Running on #${payload.channel}`;
-      modelText.textContent = payload.model_dir || "";
+      modelText.textContent = payload.model_source || payload.model_dir || "";
     }
   };
 

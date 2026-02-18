@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -53,6 +54,88 @@ _LEADING_SPEAKER_RE = re.compile(r"^\s*[A-Za-z0-9_]{2,25}:\s+")
 _EPS = 1e-9
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_model_source(app_dir: Path = APP_DIR) -> Tuple[str, Dict[str, object]]:
+    model_id = os.getenv("MODEL_ID", "").strip()
+    model_revision = os.getenv("MODEL_REVISION", "").strip() or None
+    hf_token = os.getenv("HF_TOKEN", "").strip() or os.getenv("HUGGINGFACE_HUB_TOKEN", "").strip() or None
+    local_only = _env_bool("MODEL_LOCAL_ONLY", default=False)
+    allow_local_fallback = _env_bool("ALLOW_LOCAL_MODEL_FALLBACK", default=False)
+
+    if model_id:
+        return model_id, {
+            "revision": model_revision,
+            "token": hf_token,
+            "local_files_only": local_only,
+        }
+
+    if not allow_local_fallback:
+        raise ValueError(
+            "MODEL_ID is required. Local model fallback is disabled. "
+            "Set ALLOW_LOCAL_MODEL_FALLBACK=1 to allow local loading."
+        )
+
+    env_model_dir = os.getenv("CARDIFF_MODEL_DIR", "").strip()
+    if env_model_dir:
+        raw = Path(env_model_dir)
+        for p in [raw, app_dir / raw]:
+            if p.exists():
+                return str(p), {"revision": None, "token": None, "local_files_only": True}
+
+    candidates = [
+        app_dir / "data" / "cardiff_sentiment_model_v2",
+        app_dir / "data" / "cardiff_sentiment_model",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c), {"revision": None, "token": None, "local_files_only": True}
+
+    return str(candidates[0]), {"revision": None, "token": None, "local_files_only": True}
+
+
+def _build_pretrained_kwargs(
+        revision: Optional[str] = None,
+        token: Optional[str] = None,
+        local_files_only: bool = False,
+) -> Dict[str, object]:
+    kwargs: Dict[str, object] = {"local_files_only": bool(local_files_only)}
+    if revision:
+        kwargs["revision"] = revision
+    if token:
+        kwargs["token"] = token
+    return kwargs
+
+
+def _call_from_pretrained(loader, source: str, kwargs: Dict[str, object]):
+    try:
+        return loader.from_pretrained(source, **kwargs)
+    except TypeError:
+        if "token" in kwargs:
+            compat_kwargs = dict(kwargs)
+            compat_kwargs["use_auth_token"] = compat_kwargs.pop("token")
+            return loader.from_pretrained(source, **compat_kwargs)
+        raise
+
+
+def _from_pretrained(loader, source: str, kwargs: Dict[str, object]):
+    try:
+        return _call_from_pretrained(loader, source, kwargs)
+    except (ValueError, ImportError):
+        # In mixed Python envs, fast tokenizer init can fail due optional deps;
+        # retry with the slow tokenizer implementation before failing hard.
+        if loader is AutoTokenizer and not kwargs.get("use_fast") is False:
+            slow_kwargs = dict(kwargs)
+            slow_kwargs["use_fast"] = False
+            return _call_from_pretrained(loader, source, slow_kwargs)
+        raise
+
+
 def signal_handler(sig, frame):
     global listener
     if listener:
@@ -71,7 +154,7 @@ def get_sentiment_color(sentiment):
 class BertSentimentClassifier:
     def __init__(
             self,
-            model_dir: Path,
+            model_source: str,
             max_length: int = 128,
             use_emote_tags: bool = False,
             emote_lexicon_path: str = "",
@@ -81,9 +164,18 @@ class BertSentimentClassifier:
             target_priors_csv: str = "",
             train_priors_csv: str = "",
             normalize_twitter: bool = False,
+            model_revision: Optional[str] = None,
+            hf_token: Optional[str] = None,
+            local_files_only: bool = False,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+        pretrained_kwargs = _build_pretrained_kwargs(
+            revision=model_revision,
+            token=hf_token,
+            local_files_only=local_files_only,
+        )
+        self.model_source = model_source
+        self.tokenizer = _from_pretrained(AutoTokenizer, model_source, pretrained_kwargs)
+        self.model = _from_pretrained(AutoModelForSequenceClassification, model_source, pretrained_kwargs)
         self.model.eval()
         self.max_length = max_length
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -323,13 +415,13 @@ async def main():
 
     try:
         print("[1/3] Loading Cardiff sentiment model...")
-        model_dir = APP_DIR / "data" / "cardiff_sentiment_model_v2"
-        if not model_dir.exists():
-            model_dir = APP_DIR / "data" / "cardiff_sentiment_model"
-        if not model_dir.exists():
+        model_source, model_opts = resolve_model_source(APP_DIR)
+        local_model_dir = Path(model_source)
+        has_local_model = local_model_dir.exists()
+        if not has_local_model and not os.getenv("MODEL_ID", "").strip():
             raise FileNotFoundError(
-                "Cardiff model not found. Train first with: "
-                "python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model_v2"
+                "Local Cardiff model not found. Set MODEL_ID=JDMates/TwitchRoBERTaSentiment "
+                "or train first with: python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model_v2"
             )
 
         max_length = int(os.getenv("BERT_MAX_LENGTH", "128"))
@@ -339,11 +431,11 @@ async def main():
         bert_target_priors = os.getenv("BERT_TARGET_PRIORS", "")
         bert_train_priors = os.getenv("BERT_TRAIN_PRIORS", "")
 
-        meta_path = model_dir / "model_meta.json"
+        meta_path = local_model_dir / "model_meta.json"
         use_emote_tags = False
         normalize_twitter = False
         meta_lexicon_path = ""
-        if meta_path.exists():
+        if has_local_model and meta_path.exists():
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             use_emote_tags = bool(meta.get("use_emote_tags", False))
@@ -364,7 +456,7 @@ async def main():
                     lexicon_path = str(project_candidate)
 
         classifier = BertSentimentClassifier(
-            model_dir=model_dir,
+            model_source=model_source,
             max_length=max_length,
             use_emote_tags=use_emote_tags,
             emote_lexicon_path=lexicon_path,
@@ -374,8 +466,13 @@ async def main():
             target_priors_csv=bert_target_priors,
             train_priors_csv=bert_train_priors,
             normalize_twitter=normalize_twitter,
+            model_revision=model_opts.get("revision"),  # type: ignore[arg-type]
+            hf_token=model_opts.get("token"),  # type: ignore[arg-type]
+            local_files_only=bool(model_opts.get("local_files_only", False)),
         )
-        print(f"   Loaded: {model_dir}")
+        print(f"   Loaded: {model_source}")
+        if model_opts.get("revision"):
+            print(f"   Revision: {model_opts['revision']}")
         print(f"   Device: {classifier.device}")
         print(f"   Emote tags: {'enabled' if use_emote_tags else 'disabled'}")
         print(f"   Twitter normalization: {'enabled' if normalize_twitter else 'disabled'}")
