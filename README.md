@@ -35,23 +35,18 @@ The repository includes a labeled Twitch chat dataset, a Streamlit annotation to
 ## What Each Part Does
 
 ### Dataset
-
-`sentiment_datasets/Twitch_Sentiment_Labels.csv` stores message-level annotations with the following columns: `message_id`, `message`, `sentiment`, `confidence`, `labeled_by`, and `timestamp`. Training scripts collapse duplicate labels into a gold label using confidence-weighted voting. The `sentiment_datasets/` directory is included intentionally so the final labeled data used in the project is easy to inspect and reuse.
+`sentiment_datasets/Twitch_Sentiment_Labels.csv` stores message annotations with the following columns: `message_id`, `message`, `sentiment`, `confidence`, `labeled_by`, and `timestamp`. Training scripts collapse duplicate labels into a gold label using confidence-weighted voting. The `sentiment_datasets/` directory is included intentionally so the final labeled data used in the project is easy to inspect and reuse.
 
 ### Classical Baseline
-
 `src/advanced_lr_model.py` trains a logistic regression classifier using word-level TF-IDF features, character n-grams, handcrafted message style features, and Twitch emote sentiment scores derived from our custom lexicon.
 
 ### Transformer Models
-
-`src/bert_sentiment_model.py` fine-tunes a Hugging Face sequence classifier on the gold-labeled dataset. `src/cardiff_sentiment_model.py` is a thin wrapper around the same trainer, preconfigured for the CardiffNLP Twitter RoBERTa model. Both pipelines support emote-tag text augmentation, train/validation/test splits, optional Twitter-style normalization, and saved model artifacts under `data/`. The main model used by the live demo and notebook is the Cardiff-based checkpoint on Hugging Face: [`JDMates/TwitchRoBERTaSentiment`](https://huggingface.co/JDMates/TwitchRoBERTaSentiment).
+`src/bert_sentiment_model.py` fine-tunes a Hugging Face sequence classifier on the labeled dataset. `src/cardiff_sentiment_model.py` is a thin wrapper around the same trainer, preconfigured for the CardiffNLP Twitter RoBERTa model. Both support emote tag text augmentation, train/validation/test splits, optional normalization, and saved model artifacts under `data/`. The main model used by the live demo and notebook is the Cardiff based checkpoint on Hugging Face: [`JDMates/TwitchRoBERTaSentiment`](https://huggingface.co/JDMates/TwitchRoBERTaSentiment).
 
 ### Live Inference
-
 `display_bert.py` connects to Twitch IRC, loads a transformer sentiment model, and prints live classified messages in the terminal. `web_cardiff_chat.py` serves a browser dashboard that streams live chat and rolling sentiment statistics over WebSockets.
 
 ### Labeling Tool
-
 `src/labeler_app.py` is a Streamlit app for assigning sentiment labels with optional Google Sheets sync, which is how all three team members labeled data collaboratively during the project.
 
 ## Setup
@@ -96,8 +91,7 @@ MODEL_ID=JDMates/TwitchRoBERTaSentiment
 ```
 
 ## Training
-
-The dataset lives under `sentiment_datasets/`, so pass the path explicitly when running training scripts.
+The dataset is under `sentiment_datasets/`, so pass the path explicitly when running training scripts.
 
 ### Logistic Regression
 ```bash
@@ -113,7 +107,6 @@ python src/bert_sentiment_model.py --data sentiment_datasets/Twitch_Sentiment_La
 ```bash
 python src/cardiff_sentiment_model.py --data sentiment_datasets/Twitch_Sentiment_Labels.csv --emote_lexicon sentiment_datasets/twitch_emote_vader_lexicon.txt --normalize_twitter --output_dir data/cardiff_sentiment_model
 ```
-
 All scripts save checkpoints and model artifacts under `data/`. The live dashboard loads models via `MODEL_ID`, so using a freshly trained local model for live inference requires either uploading it to Hugging Face or adapting the loader.
 
 ## Running the Live Analyzer
@@ -122,35 +115,31 @@ All scripts save checkpoints and model artifacts under `data/`. The live dashboa
 ```bash
 python display_bert.py
 ```
-
 You will be prompted for a Twitch channel name. The script connects to Twitch IRC, classifies each incoming message, and prints the sentiment label, confidence score, username, and message text in real time, with periodic aggregate statistics.
 
 ### Web dashboard
 ```bash
 python -m uvicorn web_cardiff_chat:app --reload
 ```
-
 Then open `http://127.0.0.1:8000`. The dashboard supports start/stop channel listening from the browser, a live message stream with sentiment badges, rolling positive/neutral/negative percentages, and a popout view for chat monitoring.
 
 ## Labeling More Data
 ```bash
 streamlit run src/labeler_app.py
 ```
-
 Google Sheets sync requires a service-account credentials file added to Streamlit secrets. Without it, the local annotation flow still works as the primary labeling interface.
 
 ## Scraping Emotes
 ```bash
 python src/scrape_ffz.py
 ```
-
-This writes a JSON file of FrankerFaceZ emote names that can be used for lexicon construction or feature engineering experiments.
+This writes a JSON file of FrankerFaceZ emote names that can be used for lexicon construction.
 
 ## Notebook
 
-`project_sentiment.ipynb` is the submission notebook for the project demo. It takes a fast, focused path through the project rather than reproducing the full training pipeline: it loads the fine-tuned Cardiff RoBERTa model from Hugging Face, reads a small sample chat log from `test.txt`, runs sentiment predictions on a contiguous 25-message window, and displays predicted labels and confidence scores inline.
+`project_sentiment.ipynb` is the submission notebook for the project demo. It loads the fine-tuned Cardiff RoBERTa model from Hugging Face, reads a small sample chat log from `test.txt`, runs sentiment predictions on a contiguous 25 message window, and displays predicted labels and confidence scores inline.
 
-The notebook is designed to be lightweight and demonstrative. The full training and live inference workflows are available in `src/`, `display_bert.py`, and `web_cardiff_chat.py`.
+The notebook is designed to be demonstrative. The full training and live inference workflows are available in `src/`, `display_bert.py`, and `web_cardiff_chat.py`.
 
 A few notes:
 
