@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import os
 import time
@@ -12,13 +12,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from display_bert import BertSentimentClassifier, resolve_model_source
-from twitch_listener import SimpleTwitchChatListener
+from display_bert import SentModel, get_model_src
+from twitch_listener import ChatListener
 
 APP_DIR = Path(__file__).resolve().parent
 
 
-def _load_env_from_nearest_parent() -> None:
+def _load_env() -> None:
     for base in [APP_DIR, *APP_DIR.parents]:
         env_path = base / ".env"
         if env_path.exists():
@@ -27,7 +27,7 @@ def _load_env_from_nearest_parent() -> None:
     load_dotenv()
 
 
-_load_env_from_nearest_parent()
+_load_env()
 
 BOT_TOKEN = os.getenv("TWITCH_BOT_TOKEN")
 BOT_NICK = os.getenv("TWITCH_BOT_NICK", "StreamAnalysisBot")
@@ -37,12 +37,12 @@ app = FastAPI(title="Twitch Sentiment Web Chat")
 web_dir = APP_DIR / "web"
 app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
 
-listener: Optional[SimpleTwitchChatListener] = None
-listener_task: Optional[asyncio.Task] = None
-classifier: Optional[BertSentimentClassifier] = None
-connected_clients: Set[WebSocket] = set()
-ROLLING_WINDOW_SIZE = 50
-recent_messages = deque(maxlen=ROLLING_WINDOW_SIZE)
+listener: Optional[ChatListener] = None
+listen_task: Optional[asyncio.Task] = None
+clf: Optional[SentModel] = None
+clients: Set[WebSocket] = set()
+WIN = 50
+recent_msgs = deque(maxlen=WIN)
 stats = {
     "running": False,
     "channel": "",
@@ -50,15 +50,15 @@ stats = {
     "started_at": 0.0,
     "sentiments": Counter(),
 }
-_clients_lock = asyncio.Lock()
+_ws_lock = asyncio.Lock()
 
 
-class StartRequest(BaseModel):
+class StartReq(BaseModel):
     channel: str
 
 
-def load_classifier() -> BertSentimentClassifier:
-    model_source, model_opts = resolve_model_source(APP_DIR)
+def load_clf() -> SentModel:
+    model_source, model_opts = get_model_src(APP_DIR)
     local_model_dir = Path(model_source)
     has_local_model = local_model_dir.exists()
     if not has_local_model and not os.getenv("MODEL_ID", "").strip():
@@ -67,9 +67,9 @@ def load_classifier() -> BertSentimentClassifier:
             "or train first with: python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model_v2"
         )
 
-    max_length = int(os.getenv("BERT_MAX_LENGTH", "128"))
+    max_len = int(os.getenv("BERT_MAX_LENGTH", "128"))
     min_conf = float(os.getenv("BERT_MIN_CONFIDENCE", "0.55"))
-    min_margin = float(os.getenv("BERT_MIN_MARGIN", "0.10"))
+    min_gap = float(os.getenv("BERT_MIN_MARGIN", "0.10"))
     use_prior = os.getenv("BERT_USE_PRIOR_CORRECTION", "0").strip().lower() in {"1", "true", "yes", "on"}
     target_priors = os.getenv("BERT_TARGET_PRIORS", "")
     train_priors = os.getenv("BERT_TRAIN_PRIORS", "")
@@ -93,44 +93,44 @@ def load_classifier() -> BertSentimentClassifier:
                 lexicon_path = str(candidate)
                 break
 
-    return BertSentimentClassifier(
-        model_source=model_source,
-        max_length=max_length,
+    return SentModel(
+        model_src=model_source,
+        max_len=max_len,
         use_emote_tags=use_emote_tags,
-        emote_lexicon_path=lexicon_path,
-        min_confidence=min_conf,
-        min_margin=min_margin,
-        use_prior_correction=use_prior,
-        target_priors_csv=target_priors,
-        train_priors_csv=train_priors,
-        normalize_twitter=normalize_twitter,
-        model_revision=model_opts.get("revision"),
-        hf_token=model_opts.get("token"),
-        local_files_only=bool(model_opts.get("local_files_only", False)),
+        emote_lex=lexicon_path,
+        min_conf=min_conf,
+        min_gap=min_gap,
+        use_prior=use_prior,
+        target_priors=target_priors,
+        train_priors=train_priors,
+        norm_twitter=normalize_twitter,
+        rev=model_opts.get("revision"),
+        token=model_opts.get("token"),
+        local_only=False,
     )
 
 
-async def broadcast(payload: dict) -> None:
+async def send_all(payload: dict) -> None:
     dead = []
-    async with _clients_lock:
-        for ws in connected_clients:
+    async with _ws_lock:
+        for ws in clients:
             try:
                 await ws.send_json(payload)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            connected_clients.discard(ws)
+            clients.discard(ws)
 
 
-async def on_twitch_message(msg_context):
-    global stats, classifier, recent_messages
-    if classifier is None:
+async def on_twitch_msg(msg_context):
+    global stats, clf, recent_msgs
+    if clf is None:
         return
-    sentiment, confidence = classifier.predict(msg_context.text)
+    sentiment, confidence = clf.predict(msg_context.text)
 
     stats["total"] += 1
     stats["sentiments"][sentiment] += 1
-    recent_messages.append((float(msg_context.timestamp), sentiment))
+    recent_msgs.append((float(msg_context.timestamp), sentiment))
 
     payload = {
         "type": "message",
@@ -143,41 +143,41 @@ async def on_twitch_message(msg_context):
         "confidence": confidence,
         "channel": stats["channel"],
     }
-    await broadcast(payload)
-    window_count = len(recent_messages)
-    window_counts = Counter([s for _, s in recent_messages])
+    await send_all(payload)
+    win_n = len(recent_msgs)
+    win_counts = Counter([s for _, s in recent_msgs])
     mps = 0.0
-    if window_count >= 2:
-        first_ts = recent_messages[0][0]
-        last_ts = recent_messages[-1][0]
+    if win_n >= 2:
+        first_ts = recent_msgs[0][0]
+        last_ts = recent_msgs[-1][0]
         span = max(0.001, last_ts - first_ts)
-        mps = window_count / span
+        mps = win_n / span
 
-    await broadcast(
+    await send_all(
         {
             "type": "stats",
             "total": stats["total"],
-            "window_size": ROLLING_WINDOW_SIZE,
-            "window_count": window_count,
+            "window_size": WIN,
+            "window_count": win_n,
             "messages_per_second": mps,
             "sentiments": {
-                "Positive": window_counts["Positive"],
-                "Neutral": window_counts["Neutral"],
-                "Negative": window_counts["Negative"],
+                "Positive": win_counts["Positive"],
+                "Neutral": win_counts["Neutral"],
+                "Negative": win_counts["Negative"],
             },
             "pct": {
-                "Positive": (window_counts["Positive"] / window_count * 100.0 if window_count else 0.0),
-                "Neutral": (window_counts["Neutral"] / window_count * 100.0 if window_count else 0.0),
-                "Negative": (window_counts["Negative"] / window_count * 100.0 if window_count else 0.0),
+                "Positive": (win_counts["Positive"] / win_n * 100.0 if win_n else 0.0),
+                "Neutral": (win_counts["Neutral"] / win_n * 100.0 if win_n else 0.0),
+                "Negative": (win_counts["Negative"] / win_n * 100.0 if win_n else 0.0),
             },
         }
     )
 
 
 @app.on_event("startup")
-async def startup_event():
-    global classifier
-    classifier = load_classifier()
+async def on_start():
+    global clf
+    clf = load_clf()
 
 
 @app.get("/")
@@ -187,35 +187,35 @@ async def root():
 
 @app.get("/api/status")
 async def status():
-    model_source, _ = resolve_model_source(APP_DIR)
-    window_count = len(recent_messages)
-    window_counts = Counter([s for _, s in recent_messages])
+    model_source, _ = get_model_src(APP_DIR)
+    win_n = len(recent_msgs)
+    win_counts = Counter([s for _, s in recent_msgs])
     mps = 0.0
-    if window_count >= 2:
-        first_ts = recent_messages[0][0]
-        last_ts = recent_messages[-1][0]
+    if win_n >= 2:
+        first_ts = recent_msgs[0][0]
+        last_ts = recent_msgs[-1][0]
         span = max(0.001, last_ts - first_ts)
-        mps = window_count / span
+        mps = win_n / span
     return {
         "running": stats["running"],
         "channel": stats["channel"],
         "total": stats["total"],
         "started_at": stats["started_at"],
         "model_source": str(model_source),
-        "window_size": ROLLING_WINDOW_SIZE,
-        "window_count": window_count,
+        "window_size": WIN,
+        "window_count": win_n,
         "messages_per_second": mps,
         "pct": {
-            "Positive": (window_counts["Positive"] / window_count * 100.0 if window_count else 0.0),
-            "Neutral": (window_counts["Neutral"] / window_count * 100.0 if window_count else 0.0),
-            "Negative": (window_counts["Negative"] / window_count * 100.0 if window_count else 0.0),
+            "Positive": (win_counts["Positive"] / win_n * 100.0 if win_n else 0.0),
+            "Neutral": (win_counts["Neutral"] / win_n * 100.0 if win_n else 0.0),
+            "Negative": (win_counts["Negative"] / win_n * 100.0 if win_n else 0.0),
         },
     }
 
 
 @app.post("/api/start")
-async def start(req: StartRequest):
-    global listener, listener_task, stats, recent_messages
+async def start(req: StartReq):
+    global listener, listen_task, stats, recent_msgs
 
     if not BOT_TOKEN:
         raise HTTPException(status_code=400, detail="Missing TWITCH_BOT_TOKEN in .env")
@@ -232,13 +232,13 @@ async def start(req: StartRequest):
     if not bot_token.lower().startswith("oauth:"):
         bot_token = f"oauth:{bot_token}"
 
-    listener = SimpleTwitchChatListener(
+    listener = ChatListener(
         channel=channel,
         bot_token=bot_token,
         nickname=BOT_NICK,
-        on_message_callback=on_twitch_message,
+        on_msg=on_twitch_msg,
     )
-    listener_task = asyncio.create_task(listener.start())
+    listen_task = asyncio.create_task(listener.start())
 
     stats = {
         "running": True,
@@ -247,37 +247,37 @@ async def start(req: StartRequest):
         "started_at": time.time(),
         "sentiments": Counter(),
     }
-    recent_messages.clear()
-    await broadcast({"type": "system", "text": f"Connected to #{channel}"})
+    recent_msgs.clear()
+    await send_all({"type": "system", "text": f"Connected to #{channel}"})
     return {"ok": True, "channel": channel}
 
 
 @app.post("/api/stop")
 async def stop():
-    global listener, listener_task, stats, recent_messages
+    global listener, listen_task, stats, recent_msgs
     if listener is not None:
         await listener.stop()
-    if listener_task is not None:
+    if listen_task is not None:
         try:
-            await asyncio.wait_for(listener_task, timeout=2.0)
+            await asyncio.wait_for(listen_task, timeout=2.0)
         except Exception:
-            listener_task.cancel()
+            listen_task.cancel()
     listener = None
-    listener_task = None
+    listen_task = None
     was_channel = stats["channel"]
     stats["running"] = False
     stats["channel"] = ""
-    recent_messages.clear()
-    await broadcast({"type": "system", "text": f"Stopped listener for #{was_channel}"})
+    recent_msgs.clear()
+    await send_all({"type": "system", "text": f"Stopped listener for #{was_channel}"})
     return {"ok": True}
 
 
 @app.websocket("/ws/messages")
-async def websocket_messages(ws: WebSocket):
+async def ws_msgs(ws: WebSocket):
     await ws.accept()
-    async with _clients_lock:
-        connected_clients.add(ws)
-    model_source, _ = resolve_model_source(APP_DIR)
+    async with _ws_lock:
+        clients.add(ws)
+    model_source, _ = get_model_src(APP_DIR)
     try:
         await ws.send_json(
             {
@@ -286,7 +286,7 @@ async def websocket_messages(ws: WebSocket):
                 "channel": stats["channel"],
                 "total": stats["total"],
                 "model_source": str(model_source),
-                "window_size": ROLLING_WINDOW_SIZE,
+                "window_size": WIN,
             }
         )
         while True:
@@ -294,5 +294,19 @@ async def websocket_messages(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        async with _clients_lock:
-            connected_clients.discard(ws)
+        async with _ws_lock:
+            clients.discard(ws)
+
+
+# Compatibility aliases
+StartRequest = StartReq
+load_classifier = load_clf
+broadcast = send_all
+on_twitch_message = on_twitch_msg
+startup_event = on_start
+websocket_messages = ws_msgs
+ROLLING_WINDOW_SIZE = WIN
+recent_messages = recent_msgs
+connected_clients = clients
+_clients_lock = _ws_lock
+

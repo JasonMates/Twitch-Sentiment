@@ -46,7 +46,7 @@ function addSystem(text) {
   chatList.scrollTop = chatList.scrollHeight;
 }
 
-function addMessage(msg) {
+function addMsg(msg) {
   const node = tmpl.content.firstElementChild.cloneNode(true);
   node.querySelector(".msg-time").textContent = tsLabel(msg.timestamp);
   const sentClass = sentimentClass(msg.sentiment);
@@ -120,7 +120,7 @@ function connectWs() {
 
   ws.onmessage = (ev) => {
     const payload = JSON.parse(ev.data);
-    if (payload.type === "message") addMessage(payload);
+    if (payload.type === "message") addMsg(payload);
     if (payload.type === "system") addSystem(payload.text);
     if (payload.type === "stats") updateStats(payload);
     if (payload.type === "status") {

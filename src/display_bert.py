@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 import logging
 import os
@@ -9,14 +9,16 @@ import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 from dotenv import load_dotenv
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from twitch_listener import ChatListener
+try:
+    from src.deployment.twitch_listener import SimpleTwitchChatListener
+except ImportError:
+    from twitch_listener import SimpleTwitchChatListener
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -27,7 +29,7 @@ logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).resolve().parent
 
 
-def _load_env() -> None:
+def _load_env_from_nearest_parent() -> None:
     for base in [APP_DIR, *APP_DIR.parents]:
         env_path = base / ".env"
         if env_path.exists():
@@ -36,7 +38,7 @@ def _load_env() -> None:
     load_dotenv()
 
 
-_load_env()
+_load_env_from_nearest_parent()
 BOT_TOKEN = os.getenv("TWITCH_BOT_TOKEN")
 BOT_NICK = os.getenv("TWITCH_BOT_NICK", "StreamAnalysisBot")
 
@@ -54,66 +56,13 @@ _LEADING_SPEAKER_RE = re.compile(r"^\s*[A-Za-z0-9_]{2,25}:\s+")
 _EPS = 1e-9
 
 
-def get_model_src(app_dir: Path = APP_DIR) -> Tuple[str, Dict[str, object]]:
-    _ = app_dir
-    model_id = os.getenv("MODEL_ID", "").strip()
-    rev = os.getenv("MODEL_REVISION", "").strip() or None
-    token = os.getenv("HF_TOKEN", "").strip() or os.getenv("HUGGINGFACE_HUB_TOKEN", "").strip() or None
-    if not model_id:
-        raise ValueError("MODEL_ID is required. This project is configured for Hugging Face model loading only.")
-    if Path(model_id).exists():
-        raise ValueError("MODEL_ID must be a Hugging Face repo id, not a local path.")
-    return model_id, {
-        "revision": rev,
-        "token": token,
-        "local_files_only": False,
-    }
-
-
-def _hf_opts(
-        revision: Optional[str] = None,
-        token: Optional[str] = None,
-        local_files_only: bool = False,
-) -> Dict[str, object]:
-    kwargs: Dict[str, object] = {"local_files_only": bool(local_files_only)}
-    if revision:
-        kwargs["revision"] = revision
-    if token:
-        kwargs["token"] = token
-    return kwargs
-
-
-def _hf_call(loader, source: str, kwargs: Dict[str, object]):
-    try:
-        return loader.from_pretrained(source, **kwargs)
-    except TypeError:
-        if "token" in kwargs:
-            compat_kwargs = dict(kwargs)
-            compat_kwargs["use_auth_token"] = compat_kwargs.pop("token")
-            return loader.from_pretrained(source, **compat_kwargs)
-        raise
-
-
-def _hf_load(loader, source: str, kwargs: Dict[str, object]):
-    try:
-        return _hf_call(loader, source, kwargs)
-    except (ValueError, ImportError):
-        # In mixed Python envs, fast tokenizer init can fail due optional deps;
-        # retry with the slow tokenizer implementation before failing hard.
-        if loader is AutoTokenizer and not kwargs.get("use_fast") is False:
-            slow_kwargs = dict(kwargs)
-            slow_kwargs["use_fast"] = False
-            return _hf_call(loader, source, slow_kwargs)
-        raise
-
-
-def on_sig(sig, frame):
+def signal_handler(sig, frame):
     global listener
     if listener:
         asyncio.create_task(listener.stop())
 
 
-def sent_color(sentiment):
+def get_sentiment_color(sentiment):
     colors = {
         "Positive": "\033[92m",
         "Negative": "\033[91m",
@@ -122,59 +71,39 @@ def sent_color(sentiment):
     return colors.get(sentiment, "\033[0m")
 
 
-class SentModel:
+def normalize_bot_token(token: str) -> str:
+    value = (token or "").strip()
+    if value and not value.lower().startswith("oauth:"):
+        value = f"oauth:{value}"
+    return value
+
+
+class BertSentimentClassifier:
     def __init__(
             self,
-            model_src: str,
-            max_len: int = 128,
+            model_dir: Path,
+            max_length: int = 128,
             use_emote_tags: bool = False,
-            emote_lex: str = "",
-            min_conf: float = 0.55,
-            min_gap: float = 0.10,
-            use_prior: bool = False,
-            target_priors: str = "",
-            train_priors: str = "",
-            norm_twitter: bool = False,
-            rev: Optional[str] = None,
-            token: Optional[str] = None,
-            local_only: bool = False,
-            **legacy_kwargs,
+            emote_lexicon_path: str = "",
+            min_confidence: float = 0.55,
+            min_margin: float = 0.10,
+            use_prior_correction: bool = False,
+            target_priors_csv: str = "",
+            train_priors_csv: str = "",
+            normalize_twitter: bool = False,
     ):
-        # Legacy kwargs support while transitioning names.
-        model_src = str(legacy_kwargs.pop("model_source", model_src))
-        max_len = int(legacy_kwargs.pop("max_length", max_len))
-        emote_lex = str(legacy_kwargs.pop("emote_lexicon_path", emote_lex))
-        min_conf = float(legacy_kwargs.pop("min_confidence", min_conf))
-        min_gap = float(legacy_kwargs.pop("min_margin", min_gap))
-        use_prior = bool(legacy_kwargs.pop("use_prior_correction", use_prior))
-        target_priors = str(legacy_kwargs.pop("target_priors_csv", target_priors))
-        train_priors = str(legacy_kwargs.pop("train_priors_csv", train_priors))
-        norm_twitter = bool(legacy_kwargs.pop("normalize_twitter", norm_twitter))
-        rev = legacy_kwargs.pop("model_revision", rev)
-        token = legacy_kwargs.pop("hf_token", token)
-        local_only = bool(legacy_kwargs.pop("local_files_only", local_only))
-        if legacy_kwargs:
-            bad = ", ".join(sorted(legacy_kwargs.keys()))
-            raise TypeError(f"Unexpected keyword args: {bad}")
-
-        pretrained_kwargs = _hf_opts(
-            revision=rev,
-            token=token,
-            local_files_only=local_only,
-        )
-        self.model_src = model_src
-        self.tokenizer = _hf_load(AutoTokenizer, model_src, pretrained_kwargs)
-        self.model = _hf_load(AutoModelForSequenceClassification, model_src, pretrained_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir)
         self.model.eval()
-        self.max_len = max_len
+        self.max_length = max_length
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.use_emote_tags = bool(use_emote_tags)
-        self.norm_twitter = bool(norm_twitter)
-        self.emote_sents = self._load_lex(emote_lex) if self.use_emote_tags else {}
-        self.min_conf = float(min_conf)
-        self.min_gap = float(min_gap)
-        self.use_prior = bool(use_prior)
+        self.normalize_twitter = bool(normalize_twitter)
+        self.emote_sentiments = self._load_emote_lexicon(emote_lexicon_path) if self.use_emote_tags else {}
+        self.min_confidence = float(min_confidence)
+        self.min_margin = float(min_margin)
+        self.use_prior_correction = bool(use_prior_correction)
 
         id2label = getattr(self.model.config, "id2label", None) or {
             0: "Negative",
@@ -185,22 +114,13 @@ class SentModel:
         self.label2id = {v: k for k, v in self.id2label.items()}
         self.neutral_id = int(self.label2id.get("Neutral", 1))
 
-        self.target_priors = self._parse_priors(target_priors)
-        self.train_priors = self._parse_priors(train_priors)
+        self.target_priors = self._parse_prior_csv(target_priors_csv)
+        self.train_priors = self._parse_prior_csv(train_priors_csv)
         if not (self.target_priors and self.train_priors):
-            self.use_prior = False
-
-        # Legacy attribute aliases.
-        self.model_source = self.model_src
-        self.max_length = self.max_len
-        self.normalize_twitter = self.norm_twitter
-        self.emote_sentiments = self.emote_sents
-        self.min_confidence = self.min_conf
-        self.min_margin = self.min_gap
-        self.use_prior_correction = self.use_prior
+            self.use_prior_correction = False
 
     @staticmethod
-    def _load_lex(path: str) -> dict:
+    def _load_emote_lexicon(path: str) -> dict:
         lex = {}
         if not path or not os.path.exists(path):
             return lex
@@ -222,7 +142,7 @@ class SentModel:
                     lex[low] = score
         return lex
 
-    def _parse_priors(self, csv_value: str):
+    def _parse_prior_csv(self, csv_value: str):
         if not csv_value:
             return None
         parts = [p.strip() for p in csv_value.split(",")]
@@ -243,7 +163,7 @@ class SentModel:
         }
 
     @staticmethod
-    def _emote_cands(token: str) -> list:
+    def _emote_candidates(token: str) -> list:
         base = str(token).strip()
         if not base:
             return []
@@ -257,9 +177,9 @@ class SentModel:
                 seen.add(item)
         return out
 
-    def _add_emote_tags(self, text: str) -> str:
+    def _augment_with_emote_tags(self, text: str) -> str:
         msg = str(text or "")
-        if not self.emote_sents:
+        if not self.emote_sentiments:
             return msg
 
         pos = 0
@@ -267,9 +187,9 @@ class SentModel:
         neu = 0
         for tok in msg.split():
             matched = None
-            for cand in self._emote_cands(tok):
-                if cand in self.emote_sents:
-                    matched = float(self.emote_sents[cand])
+            for cand in self._emote_candidates(tok):
+                if cand in self.emote_sentiments:
+                    matched = float(self.emote_sentiments[cand])
                     break
             if matched is None:
                 continue
@@ -291,7 +211,7 @@ class SentModel:
         return f"{msg} {' '.join(tags)}"
 
     @staticmethod
-    def _norm_twitter(text: str) -> str:
+    def _normalize_twitter_text(text: str) -> str:
         msg = str(text or "")
         msg = _URL_RE.sub("http", msg)
         msg = _AT_MENTION_RE.sub("@user", msg)
@@ -301,14 +221,14 @@ class SentModel:
     @torch.no_grad()
     def predict(self, text: str):
         msg = str(text or "")
-        if self.norm_twitter:
-            msg = self._norm_twitter(msg)
+        if self.normalize_twitter:
+            msg = self._normalize_twitter_text(msg)
         if self.use_emote_tags:
-            msg = self._add_emote_tags(msg)
+            msg = self._augment_with_emote_tags(msg)
         enc = self.tokenizer(
             msg,
             truncation=True,
-            max_length=self.max_len,
+            max_length=self.max_length,
             return_tensors="pt",
         )
         enc = {k: v.to(self.device) for k, v in enc.items()}
@@ -317,7 +237,7 @@ class SentModel:
         probs = torch.softmax(logits, dim=-1)[0].detach().cpu().numpy().astype(np.float64)
 
         class_ids = [int(i) for i in range(len(probs))]
-        if self.use_prior and self.target_priors and self.train_priors:
+        if self.use_prior_correction and self.target_priors and self.train_priors:
             logp = np.log(np.clip(probs, _EPS, 1.0))
             adjusted = []
             for i, cls in enumerate(class_ids):
@@ -335,14 +255,14 @@ class SentModel:
         top_prob = float(probs[top_idx])
         margin = float(top_prob - float(probs[second_idx]))
         pred_id = int(top_idx)
-        if top_prob < self.min_conf or margin < self.min_gap:
+        if top_prob < self.min_confidence or margin < self.min_margin:
             pred_id = self.neutral_id
 
         label = self.id2label.get(pred_id, "Neutral")
         return label, top_prob
 
 
-async def on_msg(msg_context):
+async def handle_message(msg_context):
     global classifier, stats
     sentiment, confidence = classifier.predict(msg_context.text)
 
@@ -351,7 +271,7 @@ async def on_msg(msg_context):
 
     dt = datetime.fromtimestamp(msg_context.timestamp)
     time_str = dt.strftime("%H:%M:%S")
-    color = sent_color(sentiment)
+    color = get_sentiment_color(sentiment)
     reset = "\033[0m"
     conf_pct = f"{confidence * 100:.0f}%"
 
@@ -368,11 +288,11 @@ async def on_msg(msg_context):
     )
 
     if stats["total"] % 50 == 0:
-        show_stats()
+        print_stats()
 
 
-def show_stats():
-    print("\n" + "â”€" * 100)
+def print_stats():
+    print("\n" + "-" * 100)
     elapsed = time.time() - stats["start_time"]
     mins, secs = divmod(int(elapsed), 60)
     rate = stats["total"] / elapsed if elapsed > 0 else 0
@@ -380,22 +300,22 @@ def show_stats():
 
     if stats["total"] > 0:
         total = sum(stats["sentiments"].values())
-        for sentiment in ["Positive", "Neutral", "Negative"]:
+        for sentiment in ["Positive", "Negative", "Neutral"]:
             count = stats["sentiments"][sentiment]
             pct = (count / total * 100) if total > 0 else 0
-            color = sent_color(sentiment)
+            color = get_sentiment_color(sentiment)
             reset = "\033[0m"
             bar_len = int(pct / 2)
-            bar = 'â–ˆ' * bar_len
+            bar = "#" * bar_len
             print(f"  {color}{sentiment:13s}{reset}: {bar} {count:3d} ({pct:4.1f}%)")
-    print("â”€" * 100 + "\n")
+    print("-" * 100 + "\n")
 
 
 async def main():
     global listener, classifier
 
     print("\n" + "=" * 50)
-    print("TWITCH CHAT SENTIMENT ANALYZER (CARDIFF)")
+    print("TWITCH CHAT SENTIMENT ANALYZER")
     print("=" * 50)
     print()
 
@@ -405,6 +325,8 @@ async def main():
             break
         print("Channel name cannot be empty. Please try again.")
 
+    print()
+
     if not BOT_TOKEN:
         print("\nERROR: Missing TWITCH_BOT_TOKEN!")
         print("\nCreate a .env file with:")
@@ -412,28 +334,28 @@ async def main():
         return
 
     try:
-        print("[1/3] Loading Cardiff sentiment model...")
-        model_source, model_opts = get_model_src(APP_DIR)
-        local_model_dir = Path(model_source)
-        has_local_model = local_model_dir.exists()
-        if not has_local_model and not os.getenv("MODEL_ID", "").strip():
+        print("[1/3] Loading sentiment classifier...")
+        model_dir = APP_DIR / "data" / "cardiff_sentiment_model_v2"
+        if not model_dir.exists():
+            model_dir = APP_DIR / "data" / "cardiff_sentiment_model"
+        if not model_dir.exists():
             raise FileNotFoundError(
-                "Local Cardiff model not found. Set MODEL_ID=JDMates/TwitchRoBERTaSentiment "
-                "or train first with: python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model_v2"
+                "Cardiff model not found. Train first with: "
+                "python cardiff_sentiment_model.py --output_dir data/cardiff_sentiment_model_v2"
             )
 
-        max_len = int(os.getenv("BERT_MAX_LENGTH", "128"))
-        min_conf = float(os.getenv("BERT_MIN_CONFIDENCE", "0.55"))
-        min_gap = float(os.getenv("BERT_MIN_MARGIN", "0.10"))
-        use_prior = os.getenv("BERT_USE_PRIOR_CORRECTION", "0").strip().lower() in {"1", "true", "yes", "on"}
-        target_priors = os.getenv("BERT_TARGET_PRIORS", "")
-        train_priors = os.getenv("BERT_TRAIN_PRIORS", "")
+        max_length = int(os.getenv("BERT_MAX_LENGTH", "128"))
+        bert_min_conf = float(os.getenv("BERT_MIN_CONFIDENCE", "0.55"))
+        bert_min_margin = float(os.getenv("BERT_MIN_MARGIN", "0.10"))
+        bert_use_prior = os.getenv("BERT_USE_PRIOR_CORRECTION", "0").strip().lower() in {"1", "true", "yes", "on"}
+        bert_target_priors = os.getenv("BERT_TARGET_PRIORS", "")
+        bert_train_priors = os.getenv("BERT_TRAIN_PRIORS", "")
 
-        meta_path = local_model_dir / "model_meta.json"
+        meta_path = model_dir / "model_meta.json"
         use_emote_tags = False
         normalize_twitter = False
         meta_lexicon_path = ""
-        if has_local_model and meta_path.exists():
+        if meta_path.exists():
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             use_emote_tags = bool(meta.get("use_emote_tags", False))
@@ -453,42 +375,37 @@ async def main():
                 if project_candidate.exists():
                     lexicon_path = str(project_candidate)
 
-        classifier = SentModel(
-            model_src=model_source,
-            max_len=max_len,
+        classifier = BertSentimentClassifier(
+            model_dir=model_dir,
+            max_length=max_length,
             use_emote_tags=use_emote_tags,
-            emote_lex=lexicon_path,
-            min_conf=min_conf,
-            min_gap=min_gap,
-            use_prior=use_prior,
-            target_priors=target_priors,
-            train_priors=train_priors,
-            norm_twitter=normalize_twitter,
-            rev=model_opts.get("revision"),  # type: ignore[arg-type]
-            token=model_opts.get("token"),  # type: ignore[arg-type]
-            local_only=False,
+            emote_lexicon_path=lexicon_path,
+            min_confidence=bert_min_conf,
+            min_margin=bert_min_margin,
+            use_prior_correction=bert_use_prior,
+            target_priors_csv=bert_target_priors,
+            train_priors_csv=bert_train_priors,
+            normalize_twitter=normalize_twitter,
         )
-        print(f"   Loaded: {model_source}")
-        if model_opts.get("revision"):
-            print(f"   Revision: {model_opts['revision']}")
+        print(f"   Loaded: {model_dir}")
         print(f"   Device: {classifier.device}")
         print(f"   Emote tags: {'enabled' if use_emote_tags else 'disabled'}")
         print(f"   Twitter normalization: {'enabled' if normalize_twitter else 'disabled'}")
-        print(f"   Neutral gate: max_prob<{min_conf:.2f} or margin<{min_gap:.2f}")
-        print(f"   Prior correction: {'enabled' if classifier.use_prior else 'disabled'}")
+        print(f"   Neutral gate: max_prob<{bert_min_conf:.2f} or margin<{bert_min_margin:.2f}")
+        print(f"   Prior correction: {'enabled' if classifier.use_prior_correction else 'disabled'}")
 
         print("[2/3] Connecting to Twitch IRC...")
-        listener = ChatListener(
+        listener = SimpleTwitchChatListener(
             channel=channel,
-            bot_token=BOT_TOKEN,
+            bot_token=normalize_bot_token(BOT_TOKEN),
             nickname=BOT_NICK,
-            on_msg=on_msg,
+            on_message_callback=handle_message,
         )
 
         print("[3/3] Starting chat listener...\n")
-        print("Connected! Analyzing messages with Cardiff model...\n")
+        print("Connected! Analyzing messages...\n")
 
-        signal.signal(signal.SIGINT, on_sig)
+        signal.signal(signal.SIGINT, signal_handler)
         await listener.start()
 
     except asyncio.CancelledError:
@@ -497,7 +414,7 @@ async def main():
         if stats["total"] > 0:
             print("\n   FINAL STATISTICS")
             print("  " + "=" * 96)
-            show_stats()
+            print_stats()
         print("\n  Shutdown complete\n")
 
     except Exception as e:
@@ -506,19 +423,5 @@ async def main():
         sys.exit(1)
 
 
-# Compatibility aliases
-_load_env_from_nearest_parent = _load_env
-resolve_model_source = get_model_src
-_build_pretrained_kwargs = _hf_opts
-_call_from_pretrained = _hf_call
-_from_pretrained = _hf_load
-signal_handler = on_sig
-get_sentiment_color = sent_color
-BertSentimentClassifier = SentModel
-handle_message = on_msg
-print_stats = show_stats
-
-
 if __name__ == "__main__":
     asyncio.run(main())
-
